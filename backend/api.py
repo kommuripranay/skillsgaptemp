@@ -1,199 +1,197 @@
-# api.py
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import os
-import time
-import json
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+import json
+import re
 
 # -----------------------------
-# Load env
+# Load environment variables
 # -----------------------------
-load_dotenv(".env")
+load_dotenv()
 google_api_key = os.getenv("GOOGLE_API_KEY")
-if not google_api_key:
-    raise ValueError("Set GOOGLE_API_KEY in .env")
 
 # -----------------------------
-# FastAPI app
+# Initialize FastAPI app
 # -----------------------------
-app = FastAPI(title="SkillSync Adaptive Survey API")
+app = FastAPI(title="Adaptive Skill Evaluation API")
 
 # -----------------------------
-# Chat model
+# Initialize Gemini LLM
 # -----------------------------
-chat_model = ChatGoogleGenerativeAI(
+llm = ChatGoogleGenerativeAI(
     api_key=google_api_key,
-    model="gemini-2.0-flash"
+    model="gemini-2.0-flash",
+    temperature=0.7
 )
 
 # -----------------------------
-# Models
+# Models for requests
 # -----------------------------
-class StartSurveyRequest(BaseModel):
-    user_id: int
-    skill_name: str
-    skill_level: str  # Beginner / Intermediate / Expert
+class StartTestRequest(BaseModel):
+    user_id: str
+    skill: str
+    self_rating: int  # between 0–100
+
 
 class AnswerRequest(BaseModel):
-    answer: str  # selected option
+    user_id: str
+    question_id: int
+    selected_option: str
     time_taken: float  # seconds
+    previous_level: int  # 0–100
+    correct_answer: str
+
+
+class EndTestRequest(BaseModel):
+    user_id: str
+    skill: str
+
 
 # -----------------------------
-# Session storage
+# Prompt Template
 # -----------------------------
-sessions = {}
-MAX_QUESTIONS = 15
-PLACEMENT_QUESTIONS = 3  # Phase 1 questions
+question_prompt = ChatPromptTemplate.from_template("""
+        You are an expert technical test designer for adaptive skill assessments.
 
-# -----------------------------
-# Question prompt template
-# -----------------------------
-question_prompt_template = ChatPromptTemplate.from_template(
+        The user is being tested for the skill: **{skill}**
+        They believe their level is **{level}/100**.
+
+        Questions are categorized into 5 difficulty buckets:
+        - 0 - 20: very basic and conceptual
+        - 20 - 40: beginner
+        - 40 - 60: intermediate
+        - 60 - 80: advanced
+        - 80 - 100: expert
+
+        Generate **1 multiple choice question** (not all 15 at once).
+        Rules:
+        - Use the difficulty bucket nearest to the user's current estimated skill level.
+        - The question must be relevant to real-world application of the skill.
+        - Each question should have **4 options**, with only one correct answer.
+        - Use neutral, professional wording.
+
+        Return ONLY valid JSON as text not markdown in this exact structure:
+
+        {{
+        "question_id": {qid},
+        "question_title": "string",
+        "options": {{
+            "opt1": "string",
+            "opt2": "string",
+            "opt3": "string",
+            "opt4": "string"
+        }},
+        "correct_answer": "optX",
+        "difficulty": {level}
+        }}
+""")
+
+def clean_llm_json(llm_text: str) -> str:
     """
-You are an AI that generates ONE skill assessment question for the skill "{skill_name}" at the "{skill_level}" point level.
-Provide the question strictly in JSON format:
-
-{{
-"question_title": "Question text here",
-"opt1": "Option 1",
-"opt2": "Option 2",
-"opt3": "Option 3",
-"opt4": "Option 4"
-}}
-Do not include anything else.
-"""
-)
+    Remove Markdown code fences and extra whitespace.
+    """
+    # Remove ```json or ``` at start
+    llm_text = re.sub(r'^```json\s*', '', llm_text.strip(), flags=re.MULTILINE)
+    # Remove ``` at end
+    llm_text = re.sub(r'```$', '', llm_text.strip(), flags=re.MULTILINE)
+    return llm_text
 
 # -----------------------------
-# Start survey
+# In-memory store (for prototype)
 # -----------------------------
-@app.post("/survey/start")
-def start_survey(req: StartSurveyRequest):
-    # Map skill_level to numeric bucket
-    level_map = {"Beginner": 100, "Intermediate": 500, "Expert": 900}
-    base = level_map.get(req.skill_level, 500)
-    lower = max(base - 100, 0)
-    upper = min(base + 100, 1000)
+active_sessions = {}
+# -----------------------------
+# API Endpoints
+# -----------------------------
 
-    sessions[req.user_id] = {
+@app.post("/start_test")
+async def start_test(req: StartTestRequest):
+    """
+    Start a new adaptive test session for a given user & skill.
+    Generates the first question based on their self rating.
+    """
+    user_session = {
         "user_id": req.user_id,
-        "skill_name": req.skill_name,
-        "phase": "placement",
-        "bucket_range": [lower, upper],
-        "min_range": 0,
-        "max_range": 1000,
-        "current_difficulty": base,
-        "current_question_num": 0,
-        "answered": [],
-        "start_time": time.time(),
-        "question_times": [],
-        "last_question_time": time.time()
+        "skill": req.skill,
+        "current_level": req.self_rating,
+        "questions_asked": 0,
+        "correct_answers": 0
     }
 
-    return {"message": "Survey started", "user_id": req.user_id, "bucket_range": [lower, upper], "phase": "placement"}
+    active_sessions[req.user_id] = user_session
 
-# -----------------------------
-# Get next question
-# -----------------------------
-@app.get("/survey/{user_id}/next")
-def next_question(user_id: int):
-    session = sessions.get(user_id)
-    if not session:
-        return {"error": "Session not found"}
-
-    if session["phase"] == "completed" or session["current_question_num"] >= MAX_QUESTIONS:
-        # Compute final score
-        base_score = session.get("bisect_score", session["current_difficulty"])
-        avg_time = sum(session["question_times"]) / len(session["question_times"]) if session["question_times"] else 0
-        fluency_bonus = max(0, int((30 - avg_time) * 2))  # faster than 30s per question
-        final_score = base_score + fluency_bonus
-        session["phase"] = "completed"
-        return {"message": "Survey completed", "final_score": final_score}
-
-    # Determine difficulty
-    if session["phase"] == "placement":
-        lower, upper = session["bucket_range"]
-        session["current_difficulty"] = (lower + upper) // 2
-    elif session["phase"] == "bisection":
-        session["current_difficulty"] = (session["min_range"] + session["max_range"]) // 2
-
-    # Generate question
-    prompt_text = question_prompt_template.format(
-        skill_name=session["skill_name"],
-        skill_level=session["current_difficulty"]
-    )
-    response = chat_model.invoke(prompt_text)
     try:
-        question_json = json.loads(response)
-    except json.JSONDecodeError:
-        return {"error": "Failed to parse JSON", "raw": response}
+        prompt = question_prompt.format_messages(skill=req.skill, level=req.self_rating, qid=1)
+        response = llm.invoke(prompt)
+        cleaned_response = clean_llm_json(response.content)
 
-    session["current_question_num"] += 1
-    question_json["id"] = session["current_question_num"]
-    question_json["start_time"] = time.time()
-    session["last_question_time"] = time.time()
-    return question_json
+        try:
+            question = json.loads(cleaned_response)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse LLM output: {str(e)}")
+        
+        user_session["last_question"] = question
+        return question
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------
-# Submit answer
-# -----------------------------
-@app.post("/survey/{user_id}/answer")
-def submit_answer(user_id: int, req: AnswerRequest):
-    session = sessions.get(user_id)
+
+@app.post("/next_question")
+async def next_question(req: AnswerRequest):
+    """
+    Adaptive question generation — adjusts difficulty based on last response correctness and time.
+    """
+    session = active_sessions.get(req.user_id)
     if not session:
-        return {"error": "Session not found"}
+        raise HTTPException(status_code=404, detail="No active test session found.")
 
-    now = time.time()
-    question_time = req.time_taken or (now - session.get("last_question_time", now))
-    session["question_times"].append(question_time)
-    session["last_question_time"] = now
+    # Adaptive logic: adjust skill level estimate
+    level = session["current_level"]
+    time_factor = max(0.5, min(1.5, 30 / (req.time_taken + 1)))  # 30s ideal
 
-    # Record answer
-    session["answered"].append({
-        "qid": session["current_question_num"],
-        "answer": req.answer,
-        "difficulty": session["current_difficulty"],
-        "time_taken": question_time
-    })
+    if req.selected_option == req.correct_answer:
+        new_level = min(100, int(level + (5 * time_factor)))
+        session["correct_answers"] += 1
+    else:
+        new_level = max(0, int(level - (5 / time_factor)))
 
-    # Phase logic
-    if session["phase"] == "placement":
-        if session["current_question_num"] >= PLACEMENT_QUESTIONS:
-            # Simple check: count correct answers (assume opt2 correct for demo)
-            correct_count = sum(1 for a in session["answered"] if a["answer"].lower() == "opt2")
-            low, high = session["bucket_range"]
-            if correct_count >= 2:
-                session["min_range"] = high
-            else:
-                session["max_range"] = low
-            session["phase"] = "bisection"
-    elif session["phase"] == "bisection":
-        last_answer = session["answered"][-1]
-        correct_option = "opt2"  # placeholder
-        if last_answer["answer"].lower() == correct_option:
-            session["min_range"] = session["current_difficulty"]
-        else:
-            session["max_range"] = session["current_difficulty"]
+    session["questions_asked"] += 1
+    session["current_level"] = new_level
 
-    # Check for completion
-    if session["current_question_num"] >= MAX_QUESTIONS:
-        session["phase"] = "completed"
+    try:
+        prompt = question_prompt.format_messages(skill=session["skill"], level=new_level, qid=session["questions_asked"] + 1)
+        response = llm.invoke(prompt)
+        cleaned_response = clean_llm_json(response.content)
+
+        try:
+            question = json.loads(cleaned_response)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=500, detail=f"Failed to parse LLM output: {str(e)}")
+        session["last_question"] = question
+        return question
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/end_test")
+async def end_test(req: EndTestRequest):
+    """
+    Ends the test and returns final score.
+    """
+    session = active_sessions.pop(req.user_id, None)
+    if not session:
+        raise HTTPException(status_code=404, detail="No active test found for user.")
+
+    # Simple scoring rule
+    score = (session["correct_answers"] / max(1, session["questions_asked"])) * 100
 
     return {
-        "message": "Answer recorded",
-        "next_phase": session["phase"],
-        "current_range": [session["min_range"], session["max_range"]]
+        "user_id": req.user_id,
+        "skill": req.skill,
+        "final_score": round(score, 2),
+        "questions_attempted": session["questions_asked"]
     }
-
-# -----------------------------
-# Check session status
-# -----------------------------
-@app.get("/survey/{user_id}/status")
-def check_session(user_id: int):
-    session = sessions.get(user_id)
-    if not session:
-        return {"error": "Session not found"}
-    return session
